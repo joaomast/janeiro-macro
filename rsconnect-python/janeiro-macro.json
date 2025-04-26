@@ -1,0 +1,12 @@
+{
+    "https://api.shinyapps.io": {
+        "server_url": "https://api.shinyapps.io",
+        "filename": "/home/runner/work/janeiro-macro/janeiro-macro",
+        "app_url": "https://janeiro-macro.shinyapps.io/previsao_macro/",
+        "app_id": 14622173,
+        "app_guid": null,
+        "title": "previsao_macro",
+        "app_mode": "python-shiny",
+        "app_store_version": 1
+    }
+}
