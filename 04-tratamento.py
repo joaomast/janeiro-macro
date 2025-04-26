@@ -11,6 +11,7 @@ for f in df_tratado_bcb_sgs.items():
 df_tratado_bcb_sgs["Mensal"] = df_tratado_bcb_sgs["Mensal"].join(
     other = (
         df_tratado_bcb_sgs["Diária"]
+        .astype(float)
         .filter(input_bcb_sgs.query("Identificador != 'selic'")["Identificador"].to_list())
         .resample("MS")
         .mean()
@@ -29,7 +30,7 @@ df_tratado_bcb_sgs["Mensal"] = df_tratado_bcb_sgs["Mensal"].join(
         .query("index >= '2000-01-01'")
     ),
     how = "outer"
-)
+).astype(float)
 
 
 # Filtra expectativas curto prazo ~1 mês à frente e agrega pela média
@@ -209,10 +210,10 @@ for f in df_tratado_ibge_sidra.items():
 df_tratado_fred = df_bruto_fred.copy()
 
 for f in df_tratado_fred.items():
-  df_temp = f[1][0].set_index("observation_date")
+  df_temp = f[1][0].assign(observation_date = lambda x: pd.to_datetime(x.observation_date)).set_index("observation_date")
   for df in f[1][1:]:
     df_temp = df_temp.join(
-        other = df.set_index("observation_date"),
+        other = df.assign(observation_date = lambda x: pd.to_datetime(x.observation_date)).set_index("observation_date"),
         how = "outer"
         )
   df_temp = df_temp.rename_axis(index='data')  
@@ -233,7 +234,6 @@ df_tratado_fred["Mensal"] = (
       )
     .query("index >= '2000-01-01'")
 )
-
 
 # Representa em porcentagem dados do IFI
 df_tratado_ifi = (

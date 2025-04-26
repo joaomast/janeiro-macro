@@ -1,7 +1,9 @@
 # Bibliotecas
 from skforecast.ForecasterAutoreg import ForecasterAutoreg
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import Ridge, BayesianRidge
 from sklearn.preprocessing import PowerTransformer
+from io import StringIO
+import google.generativeai as genai
 import pandas as pd
 import numpy as np
 import os
@@ -93,20 +95,28 @@ x_reg = [
 # + 2 lags
 
 
-# Reestima melhor modelo com amostra completa
-forecaster = ForecasterAutoreg(
+# Reestima os 2 melhores modelos com amostra completa
+modelo1 = ForecasterAutoreg(
     regressor = Ridge(),
     lags = 2,
     transformer_y = PowerTransformer(),
     transformer_exog = PowerTransformer()
     )
-forecaster.fit(y, x[x_reg])
+modelo1.fit(y, x[x_reg])
+
+modelo2 = ForecasterAutoreg(
+    regressor = BayesianRidge(),
+    lags = 2,
+    transformer_y = PowerTransformer(),
+    transformer_exog = PowerTransformer()
+    )
+modelo2.fit(y, x[x_reg])
 
 
 # Período de previsão fora da amostra
 periodo_previsao = pd.date_range(
-    start = forecaster.last_window.index[1] + pd.offsets.QuarterBegin(1),
-    end = forecaster.last_window.index[1] + pd.offsets.QuarterBegin(h + 1),
+    start = modelo1.last_window.index[1] + pd.offsets.QuarterBegin(1),
+    end = modelo1.last_window.index[1] + pd.offsets.QuarterBegin(h + 1),
     freq = "QS"
     )
 
@@ -154,13 +164,14 @@ data_focus_expec_pib = (
             freq = "Q"
             ).to_timestamp()
     )
-    .query("DataReferencia in @periodo_previsao or DataReferencia == @forecaster.last_window.index[1]")
+    .query("DataReferencia in @periodo_previsao or DataReferencia == @modelo1.last_window.index[1]")
     .Data
     .value_counts()
     .to_frame()
     .reset_index()
-    .query("count == @h")
+    .query("count >= @h")
     .query("Data == Data.max()")
+    .head(1)
     .Data
     .to_list()[0]
 )
@@ -174,8 +185,9 @@ dados_cenario_expec_pib = (
             freq = "Q"
             ).to_timestamp()
     )
-    .query("DataReferencia in @periodo_previsao or DataReferencia == @forecaster.last_window.index[1]")
+    .query("DataReferencia in @periodo_previsao or DataReferencia == @modelo1.last_window.index[1]")
     .query("Data == @data_focus_expec_pib")
+    .query("DataReferencia in @periodo_previsao")
     .sort_values(by = "DataReferencia")
     .set_index("DataReferencia")
     .filter(["Mediana"])
@@ -224,12 +236,65 @@ dados_cenarios = (
 )
 
 # Produz previsões
-previsao = forecaster.predict_interval(
-    steps = h,
-    exog = dados_cenarios,
-    n_boot = 5000,
-    random_state = semente
+previsao1 = (
+   modelo1.predict_interval(
+      steps = h,
+      exog = dados_cenarios,
+      n_boot = 5000,
+      random_state = semente
+      )
+    .assign(Tipo = "Ridge")
+    .rename(
+       columns = {
+          "pred": "Valor", 
+          "lower_bound": "Intervalo Inferior", 
+          "upper_bound": "Intervalo Superior"
+          }
     )
+)
+
+previsao2 = (
+   modelo2.predict_interval(
+      steps = h,
+      exog = dados_cenarios,
+      n_boot = 5000,
+      random_state = semente
+      )
+    .assign(Tipo = "Bayesian Ridge")
+    .rename(
+       columns = {
+          "pred": "Valor", 
+          "lower_bound": "Intervalo Inferior", 
+          "upper_bound": "Intervalo Superior"
+          }
+    )
+)
+
+y.to_frame().join(x[x_reg]).to_csv("dados/pib.csv")
+prompt = f"""
+Assume that you are in {pd.to_datetime("today").strftime("%B %d, %Y")}. 
+Please give me your best forecast of Gross Domestic Product (GDP) for Brazil, 
+measured in annual percentage variation (accumulated rate in four quarters in 
+relation to the same period of the previous year) and published by IBGE, for 
+{periodo_previsao.min().to_period(freq = "Q").strftime("%Y Q%q")} to {periodo_previsao.max().to_period(freq = "Q").strftime("%Y Q%q")}. 
+Use the historical GDP data from the attached CSV file named "pib.csv", where "pib" 
+is the target column, "data" is the date column and the others are exogenous variables. 
+Please give me numeric values for these forecasts, in a CSV like format with 
+a header, and nothing more. Do not use any information that was not available 
+to you as of {pd.to_datetime("today").strftime("%B %d, %Y")} to formulate these 
+forecasts.
+"""
+
+genai.configure(api_key = os.environ["GEMINI_API_KEY"])
+modelo_ia = genai.GenerativeModel(model_name = "gemini-1.5-pro")
+arquivo = genai.upload_file("dados/pib.csv")
+previsao3 = pd.read_csv(
+    filepath_or_buffer = StringIO(modelo_ia.generate_content([prompt, arquivo]).text),
+    names = ["date", "Valor"],
+    skiprows = 1,
+    index_col = "date",
+    converters = {"date": pd.to_datetime}
+    ).assign(Tipo = "IA")
 
 # Salvar previsões
 pasta = "previsao"
@@ -237,10 +302,8 @@ if not os.path.exists(pasta):
   os.makedirs(pasta)
   
 pd.concat(
-    [y.rename("PIB"),
-     previsao.pred.rename("Previsão"),
-     previsao.lower_bound.rename("Intervalo Inferior"),
-     previsao.upper_bound.rename("Intervalo Superior"),
-    ],
-    axis = "columns"
-    ).to_parquet("previsao/pib.parquet")
+    [y.rename("Valor").to_frame().assign(Tipo = "PIB"),
+    previsao1,
+    previsao2,
+    previsao3
+    ]).to_parquet("previsao/pib.parquet")

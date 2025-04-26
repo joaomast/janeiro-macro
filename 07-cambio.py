@@ -1,7 +1,9 @@
 # Bibliotecas
 from skforecast.ForecasterAutoreg import ForecasterAutoreg
-from sklearn.linear_model import BayesianRidge
+from sklearn.linear_model import BayesianRidge, HuberRegressor
 from sklearn.preprocessing import PowerTransformer
+from io import StringIO
+import google.generativeai as genai
 import pandas as pd
 import numpy as np
 import os
@@ -96,7 +98,7 @@ x = x.bfill().ffill()
 
 # Seleção final de variáveis
 x_reg = [
-    "swaps_di_360",
+    "selic",
     "expec_cambio",
     "ic_br_agro",
     "cotacao_petroleo_fmi"
@@ -104,27 +106,34 @@ x_reg = [
 # + 1 lag
 
 
-# Reestima melhor modelo com amostra completa
-forecaster = ForecasterAutoreg(
+# Reestima os 2 melhores modelos com amostra completa
+modelo1 = ForecasterAutoreg(
     regressor = BayesianRidge(),
     lags = 1,
     transformer_y = PowerTransformer(),
     transformer_exog = PowerTransformer()
     )
-forecaster.fit(y, x[x_reg])
+modelo1.fit(y, x[x_reg])
 
+modelo2 = ForecasterAutoreg(
+    regressor = HuberRegressor(),
+    lags = 1,
+    transformer_y = PowerTransformer(),
+    transformer_exog = PowerTransformer()
+    )
+modelo2.fit(y, x[x_reg])
 
 # Período de previsão fora da amostra
 periodo_previsao = pd.date_range(
-    start = forecaster.last_window.index[0] + pd.offsets.MonthBegin(1),
-    end = forecaster.last_window.index[0] + pd.offsets.MonthBegin(h),
+    start = modelo1.last_window.index[0] + pd.offsets.MonthBegin(1),
+    end = modelo1.last_window.index[0] + pd.offsets.MonthBegin(h),
     freq = "MS"
     )
 
-# Coleta dados de expectativas da Selic (swaps_di_360)
+# Coleta dados de expectativas da Selic (selic)
 dados_focus_selic = (
     pd.read_csv(
-        filepath_or_buffer = f"https://olinda.bcb.gov.br/olinda/servico/Expectativas/versao/v1/odata/ExpectativasMercadoTop5Selic?$filter=Data%20ge%20'{periodo_previsao.min().strftime('%Y-%m-%d')}'%20and%20tipoCalculo%20eq%20'C'&$format=text/csv",
+        filepath_or_buffer = f"https://olinda.bcb.gov.br/olinda/servico/Expectativas/versao/v1/odata/ExpectativasMercadoTop5Selic?$filter=Data%20ge%20'{modelo1.last_window.index[0].strftime('%Y-%m-%d')}'%20and%20tipoCalculo%20eq%20'C'&$format=text/csv",
         decimal = ",",
         converters = {
             "Data": pd.to_datetime,
@@ -132,20 +141,20 @@ dados_focus_selic = (
             }
         ))
 
-# Constrói cenário para expectativas de juros (swaps_di_360)
-dados_cenario_swaps_di_360 = (
+# Constrói cenário para expectativas de juros (selic)
+dados_cenario_selic = (
     dados_focus_selic
     .query("Data == Data.max()")
-    .rename(columns = {"mediana": "swaps_di_360"})
+    .rename(columns = {"mediana": "selic"})
     .head(12)
-    .filter(["swaps_di_360"])
+    .filter(["selic"])
     .set_index(periodo_previsao)
 )
 
 # Coleta dados de expectativas do câmbio (expec_cambio)
 dados_focus_cambio = (
     pd.read_csv(
-        filepath_or_buffer = f"https://olinda.bcb.gov.br/olinda/servico/Expectativas/versao/v1/odata/ExpectativaMercadoMensais?$filter=Indicador%20eq%20'C%C3%A2mbio'%20and%20baseCalculo%20eq%200%20and%20Data%20ge%20'{periodo_previsao.min().strftime('%Y-%m-%d')}'&$format=text/csv",
+        filepath_or_buffer = f"https://olinda.bcb.gov.br/olinda/servico/Expectativas/versao/v1/odata/ExpectativaMercadoMensais?$filter=Indicador%20eq%20'C%C3%A2mbio'%20and%20baseCalculo%20eq%200%20and%20Data%20ge%20'{modelo1.last_window.index[0].strftime('%Y-%m-%d')}'&$format=text/csv",
         decimal = ",",
         converters = {
             "Data": pd.to_datetime,
@@ -156,7 +165,7 @@ dados_focus_cambio = (
 # Data do relatório Focus usada para construir cenário para câmbio
 data_focus_cambio = (
     dados_focus_cambio
-    .query("DataReferencia in @periodo_previsao or DataReferencia == @forecaster.last_window.index[0]")
+    .query("DataReferencia in @periodo_previsao or DataReferencia == @modelo1.last_window.index[0]")
     .Data
     .value_counts()
     .to_frame()
@@ -170,7 +179,7 @@ data_focus_cambio = (
 # Constrói cenário para câmbio (expec_cambio)
 dados_cenario_cambio = (
     dados_focus_cambio
-    .query("DataReferencia in @periodo_previsao or DataReferencia == @forecaster.last_window.index[0]")
+    .query("DataReferencia in @periodo_previsao or DataReferencia == @modelo1.last_window.index[0]")
     .query("Data == @data_focus_cambio")
     .sort_values(by = "DataReferencia")
     .set_index("DataReferencia")
@@ -235,7 +244,7 @@ dados_cenario_cotacao_petroleo_fmi = (
 
 # Junta cenários e gera dummies sazonais
 dados_cenarios = (
-    dados_cenario_swaps_di_360
+    dados_cenario_selic
     .join(
         other = [
             dados_cenario_cambio,
@@ -247,13 +256,64 @@ dados_cenarios = (
 )
 
 # Produz previsões
-previsao = forecaster.predict_interval(
-    steps = h,
-    exog = dados_cenarios,
-    n_boot = 5000,
-    random_state = semente
+previsao1 = (
+   modelo1.predict_interval(
+      steps = h,
+      exog = dados_cenarios,
+      n_boot = 5000,
+      random_state = semente
+      )
+    .assign(Tipo = "Bayesian Ridge")
+    .rename(
+       columns = {
+          "pred": "Valor", 
+          "lower_bound": "Intervalo Inferior", 
+          "upper_bound": "Intervalo Superior"
+          }
     )
+)
 
+previsao2 = (
+   modelo2.predict_interval(
+      steps = h,
+      exog = dados_cenarios,
+      n_boot = 5000,
+      random_state = semente
+      )
+    .assign(Tipo = "Huber")
+    .rename(
+       columns = {
+          "pred": "Valor", 
+          "lower_bound": "Intervalo Inferior", 
+          "upper_bound": "Intervalo Superior"
+          }
+    )
+)
+
+y.to_frame().join(x[x_reg]).to_csv("dados/cambio.csv")
+prompt = f"""
+Assume that you are in {pd.to_datetime("today").strftime("%B %d, %Y")}. 
+Please give me your best forecast of Exchange Rate for Brazil, measured in BRL/USD 
+and published by Banco Central do Brasil, for {periodo_previsao.min().strftime("%B %Y")} 
+to {periodo_previsao.max().strftime("%B %Y")}. Use the historical Exchange Rate 
+data from the attached CSV file named "cambio.csv", where "cambio" is the target 
+column, "data" is the date column and the others are exogenous variables. 
+Please give me numeric values for these forecasts, in a CSV like format with 
+a header, and nothing more. Do not use any information that was not available 
+to you as of {pd.to_datetime("today").strftime("%B %d, %Y")} to formulate these 
+forecasts.
+"""
+
+genai.configure(api_key = os.environ["GEMINI_API_KEY"])
+modelo_ia = genai.GenerativeModel(model_name = "gemini-1.5-pro")
+arquivo = genai.upload_file("dados/cambio.csv")
+previsao3 = pd.read_csv(
+    filepath_or_buffer = StringIO(modelo_ia.generate_content([prompt, arquivo]).text),
+    names = ["date", "Valor"],
+    skiprows = 1,
+    index_col = "date",
+    converters = {"date": pd.to_datetime}
+    ).assign(Tipo = "IA")
 
 # Salvar previsões
 pasta = "previsao"
@@ -261,10 +321,8 @@ if not os.path.exists(pasta):
   os.makedirs(pasta)
   
 pd.concat(
-    [y.rename("Câmbio"),
-     previsao.pred.rename("Previsão"),
-     previsao.lower_bound.rename("Intervalo Inferior"),
-     previsao.upper_bound.rename("Intervalo Superior"),
-    ],
-    axis = "columns"
-    ).to_parquet("previsao/cambio.parquet")
+    [y.rename("Valor").to_frame().assign(Tipo = "Câmbio"),
+    previsao1,
+    previsao2,
+    previsao3
+    ]).to_parquet("previsao/cambio.parquet")

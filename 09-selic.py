@@ -4,6 +4,8 @@ from sklearn.ensemble import VotingRegressor
 from sklearn.linear_model import Ridge, BayesianRidge
 from sklearn.svm import LinearSVR
 from sklearn.preprocessing import PowerTransformer
+from io import StringIO
+import google.generativeai as genai
 import statsmodels.api as sm
 import pandas as pd
 import numpy as np
@@ -106,8 +108,8 @@ x = x.bfill().ffill()
 x_teorico = x_teorico.bfill().ffill()
 
 
-# Reestima melhor modelo com amostra completa
-forecaster = ForecasterAutoreg(
+# Reestima os 2 melhores modelos com amostra completa
+modelo1 = ForecasterAutoreg(
     regressor = VotingRegressor([
         ("bayes", BayesianRidge()),
         ("svr", LinearSVR(random_state = semente, dual = True, max_iter = 100000)),
@@ -117,12 +119,21 @@ forecaster = ForecasterAutoreg(
     transformer_y = PowerTransformer(),
     transformer_exog = PowerTransformer()
     )
-forecaster.fit(y, x_teorico)
+modelo1.fit(y, x_teorico)
+
+modelo2 = ForecasterAutoreg(
+    regressor = BayesianRidge(),
+    lags = 2,
+    transformer_y = PowerTransformer(),
+    transformer_exog = PowerTransformer()
+    )
+modelo2.fit(y, x_teorico)
+
 
 # Período de previsão fora da amostra
 periodo_previsao = pd.date_range(
-    start = forecaster.last_window.index[1] + pd.offsets.MonthBegin(1),
-    end = forecaster.last_window.index[1] + pd.offsets.MonthBegin(h),
+    start = modelo1.last_window.index[1] + pd.offsets.MonthBegin(1),
+    end = modelo1.last_window.index[1] + pd.offsets.MonthBegin(h),
     freq = "MS"
     )
 
@@ -174,7 +185,14 @@ dados_cenario_inflacao_hiato = (
     .ffill()
     .query("index >= @periodo_previsao.min()")
     .drop("data", axis = "columns")
-    .join(other = dados_tratados.filter(["meta_inflacao"]).ffill(), how = "left")
+    .join(
+        other = pd.Series(
+            dados_tratados.filter(["meta_inflacao"]).dropna().iloc[-1].to_list() * periodo_previsao.shape[0], 
+            index = periodo_previsao,
+            name = "meta_inflacao"
+            ),
+        how = "left"
+        )
     .ffill()
     .assign(inflacao_hiato = lambda x: x.expec_ipca_12m - x.meta_inflacao.shift(-h))
     .query("index <= @periodo_previsao.max()")
@@ -188,12 +206,64 @@ dados_cenarios = dados_cenario_constante.join(
     )
 
 # Produz previsões
-previsao = forecaster.predict_interval(
-    steps = h,
-    exog = dados_cenarios,
-    n_boot = 5000,
-    random_state = semente
+previsao1 = (
+   modelo1.predict_interval(
+      steps = h,
+      exog = dados_cenarios,
+      n_boot = 5000,
+      random_state = semente
+      )
+    .assign(Tipo = "Ensemble")
+    .rename(
+       columns = {
+          "pred": "Valor", 
+          "lower_bound": "Intervalo Inferior", 
+          "upper_bound": "Intervalo Superior"
+          }
     )
+)
+
+previsao2 = (
+   modelo2.predict_interval(
+      steps = h,
+      exog = dados_cenarios,
+      n_boot = 5000,
+      random_state = semente
+      )
+    .assign(Tipo = "Bayesian Ridge")
+    .rename(
+       columns = {
+          "pred": "Valor", 
+          "lower_bound": "Intervalo Inferior", 
+          "upper_bound": "Intervalo Superior"
+          }
+    )
+)
+
+y.to_frame().join(x_teorico).to_csv("dados/selic.csv")
+prompt = f"""
+Assume that you are in {pd.to_datetime("today").strftime("%B %d, %Y")}. 
+Please give me your best forecast of Selic Target Interest Rate for Brazil, 
+measured in % per annum and published by Banco Central do Brasil, for {periodo_previsao.min().strftime("%B %Y")} 
+to {periodo_previsao.max().strftime("%B %Y")}. 
+Use the historical Selic Target Interest Rate data from the attached CSV file 
+named "selic.csv", where "selic" is the target column, "data" is the date column 
+and the others are exogenous variables. Please give me numeric values for these 
+forecasts, in a CSV like format with a header, and nothing more. Do not use any 
+information that was not available to you as of {pd.to_datetime("today").strftime("%B %d, %Y")} 
+to formulate these forecasts.
+"""
+
+genai.configure(api_key = os.environ["GEMINI_API_KEY"])
+modelo_ia = genai.GenerativeModel(model_name = "gemini-1.5-pro")
+arquivo = genai.upload_file("dados/selic.csv")
+previsao3 = pd.read_csv(
+    filepath_or_buffer = StringIO(modelo_ia.generate_content([prompt, arquivo]).text),
+    names = ["date", "Valor"],
+    skiprows = 1,
+    index_col = "date",
+    converters = {"date": pd.to_datetime}
+    ).assign(Tipo = "IA")
 
 # Salvar previsões
 pasta = "previsao"
@@ -201,10 +271,8 @@ if not os.path.exists(pasta):
   os.makedirs(pasta)
   
 pd.concat(
-    [y.rename("Selic"),
-     previsao.pred.rename("Previsão"),
-     previsao.lower_bound.rename("Intervalo Inferior"),
-     previsao.upper_bound.rename("Intervalo Superior"),
-    ],
-    axis = "columns"
-    ).to_parquet("previsao/selic.parquet")
+    [y.rename("Valor").to_frame().assign(Tipo = "Selic"),
+    previsao1,
+    previsao2,
+    previsao3
+    ]).to_parquet("previsao/selic.parquet")
